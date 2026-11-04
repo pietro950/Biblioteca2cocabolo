@@ -1,2 +1,5 @@
-﻿// See https://aka.ms/new-console-template for more information
-Console.WriteLine("Hello, World!");
+﻿
+using bibliotecaserver2;
+
+var server = new ServerStart();
+await server.StartAsync();
