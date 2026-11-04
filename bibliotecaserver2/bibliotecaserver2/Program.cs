@@ -1,4 +1,8 @@
-﻿using Microsoft.Data.Sqlite;
+﻿using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
 using bibliotecaserver2;
 
 namespace bibliotecaserver2;
@@ -6,11 +10,66 @@ namespace bibliotecaserver2;
 public sealed class Program
 {
     private const string ConnectionString = "Data Source=biblioteca.db";
+    private const int Port = 5000;
 
     private static void Main(string[] args)
     {
         InizializzaDatabase();
-        Console.WriteLine("Database SQLite inizializzato.");
+        AvviaServer().GetAwaiter().GetResult();
+    }
+
+    private static async Task AvviaServer()
+    {
+        var listener = new TcpListener(IPAddress.Any, Port);
+        listener.Start();
+        Console.WriteLine($"Server biblioteca in ascolto sulla porta {Port}.");
+
+        var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            cts.Cancel();
+            Console.WriteLine("\nArresto del server in corso...");
+        };
+
+        try
+        {
+            while (!cts.Token.IsCancellationRequested)
+            {
+                TcpClient client = await listener.AcceptTcpClientAsync(cts.Token);
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await GestisciClientAsync(client, cts.Token);
+                    }
+                    catch (OperationCanceledException) { }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Errore con un client: {ex.Message}");
+                    }
+                }, cts.Token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("Server arrestato.");
+        }
+        finally
+        {
+            listener.Stop();
+            Console.WriteLine("Server terminato.");
+        }
+    }
+
+    private static async Task GestisciClientAsync(TcpClient client, CancellationToken ct)
+    {
+        using (client)
+        using (NetworkStream stream = client.GetStream())
+        {
+            byte[] benvenuto = System.Text.Encoding.UTF8.GetBytes("Connesso al server biblioteca.\r\n");
+            await stream.WriteAsync(benvenuto, ct);
+        }
     }
 
     private static void InizializzaDatabase()
