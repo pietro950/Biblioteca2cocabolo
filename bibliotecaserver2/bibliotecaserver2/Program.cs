@@ -1,7 +1,8 @@
 ﻿using System.Net;
 using System.Net.Sockets;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Data.Sqlite;
 using bibliotecaserver2;
 
@@ -11,6 +12,11 @@ public sealed class Program
 {
     private const string ConnectionString = "Data Source=biblioteca.db";
     private const int Port = 5000;
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
 
     private static void Main(string[] args)
     {
@@ -64,12 +70,238 @@ public sealed class Program
 
     private static async Task GestisciClientAsync(TcpClient client, CancellationToken ct)
     {
+        var endPoint = client.Client.RemoteEndPoint;
+        Console.WriteLine($"Client connesso: {endPoint}");
+
         using (client)
         using (NetworkStream stream = client.GetStream())
+        using (var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true))
+        using (var writer = new StreamWriter(stream, Encoding.UTF8, leaveOpen: true) { AutoFlush = true })
         {
-            byte[] benvenuto = System.Text.Encoding.UTF8.GetBytes("Connesso al server biblioteca.\r\n");
-            await stream.WriteAsync(benvenuto, ct);
+            await writer.WriteLineAsync("Benvenuto nel server biblioteca. Invia un oggetto JSON per riga.");
+            await writer.WriteLineAsync("Operazioni: cerca, prestito, restituzione, stato");
+
+            string? linea;
+            while ((linea = await reader.ReadLineAsync(ct)) is not null)
+            {
+                string risposta = EseguiOperazione(linea);
+                await writer.WriteLineAsync(risposta);
+            }
         }
+
+        Console.WriteLine($"Client disconnesso: {endPoint}");
+    }
+
+    private static string EseguiOperazione(string linea)
+    {
+        try
+        {
+            var req = JsonSerializer.Deserialize<Richiesta>(linea, JsonOptions);
+            if (req is null)
+                return RispostaErrata("Richiesta non valida");
+
+            return req.Op switch
+            {
+                "cerca" => Cerca(req.Q),
+                "prestito" => Presta(req),
+                "restituzione" => Restituisci(req),
+                "stato" => StatoUtente(req.Utente),
+                null or "" => RispostaErrata("Operazione non specificata"),
+                _ => RispostaErrata($"Operazione sconosciuta: {req.Op}")
+            };
+        }
+        catch (JsonException)
+        {
+            return RispostaErrata("JSON non valido");
+        }
+        catch (Exception ex)
+        {
+            return RispostaErrata(ex.Message);
+        }
+    }
+
+    private record Richiesta(string? Op, string? Q, string? Utente, int IdLibro);
+
+    private static string Cerca(string? q)
+    {
+        using var conn = new SqliteConnection(ConnectionString);
+        conn.Open();
+
+        using var cmd = conn.CreateCommand();
+        if (string.IsNullOrWhiteSpace(q))
+        {
+            cmd.CommandText = "SELECT Id, Titolo, Autore, Disponibile FROM Libri ORDER BY Id";
+        }
+        else
+        {
+            cmd.CommandText = "SELECT Id, Titolo, Autore, Disponibile FROM Libri WHERE Titolo LIKE @q OR Autore LIKE @q ORDER BY Id";
+            cmd.Parameters.AddWithValue("@q", "%" + q + "%");
+        }
+
+        var libri = new List<object>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            libri.Add(new
+            {
+                id = reader.GetInt32(0),
+                titolo = reader.GetString(1),
+                autore = reader.GetString(2),
+                disponibile = reader.GetInt32(3) == 1
+            });
+        }
+
+        return JsonSerializer.Serialize(new { ok = true, operazione = "cerca", libri }, JsonOptions);
+    }
+
+    private static string Presta(Richiesta req)
+    {
+        if (string.IsNullOrWhiteSpace(req.Utente) || req.IdLibro <= 0)
+            return RispostaErrata("Utente e idLibro obbligatori per il prestito");
+
+        using var conn = new SqliteConnection(ConnectionString);
+        conn.Open();
+        using var tx = conn.BeginTransaction();
+        try
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+
+            cmd.CommandText = "SELECT Disponibile FROM Libri WHERE Id = @id";
+            cmd.Parameters.AddWithValue("@id", req.IdLibro);
+            var disponibile = cmd.ExecuteScalar();
+            if (disponibile == null || Convert.ToInt64(disponibile) != 1)
+            {
+                tx.Rollback();
+                return JsonSerializer.Serialize(new { ok = false, operazione = "prestito", esito = "non_disponibile", messaggio = "Libro non disponibile" }, JsonOptions);
+            }
+
+            cmd.CommandText = "UPDATE Libri SET Disponibile = 0 WHERE Id = @id";
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = @"
+INSERT INTO Prestiti (IdLibro, Utente, DataRichiesta, Stato)
+VALUES (@id, @utente, @data, 'confermato');
+SELECT last_insert_rowid();";
+            cmd.Parameters.AddWithValue("@utente", req.Utente);
+            cmd.Parameters.AddWithValue("@data", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            var idPrestito = (long)cmd.ExecuteScalar()!;
+
+            tx.Commit();
+
+            return JsonSerializer.Serialize(new
+            {
+                ok = true,
+                operazione = "prestito",
+                esito = "confermato",
+                idPrestito,
+                idLibro = req.IdLibro,
+                utente = req.Utente
+            }, JsonOptions);
+        }
+        catch
+        {
+            tx.Rollback();
+            throw;
+        }
+    }
+
+    private static string Restituisci(Richiesta req)
+    {
+        if (string.IsNullOrWhiteSpace(req.Utente) || req.IdLibro <= 0)
+            return RispostaErrata("Utente e idLibro obbligatori per la restituzione");
+
+        using var conn = new SqliteConnection(ConnectionString);
+        conn.Open();
+        using var tx = conn.BeginTransaction();
+        try
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+
+            cmd.CommandText = @"
+SELECT Id FROM Prestiti
+WHERE IdLibro = @id AND Utente = @utente AND Stato = 'confermato'
+ORDER BY DataRichiesta DESC
+LIMIT 1";
+            cmd.Parameters.AddWithValue("@id", req.IdLibro);
+            cmd.Parameters.AddWithValue("@utente", req.Utente);
+            var idPrestito = cmd.ExecuteScalar();
+
+            if (idPrestito == null)
+            {
+                tx.Rollback();
+                return JsonSerializer.Serialize(new
+                {
+                    ok = false,
+                    operazione = "restituzione",
+                    esito = "non_trovato",
+                    messaggio = "Nessun prestito attivo trovato per questo utente e libro"
+                }, JsonOptions);
+            }
+
+            cmd.CommandText = "UPDATE Prestiti SET Stato = 'restituito' WHERE Id = @pid";
+            cmd.Parameters.AddWithValue("@pid", idPrestito);
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = "UPDATE Libri SET Disponibile = 1 WHERE Id = @id";
+            cmd.ExecuteNonQuery();
+
+            tx.Commit();
+
+            return JsonSerializer.Serialize(new
+            {
+                ok = true,
+                operazione = "restituzione",
+                esito = "completato",
+                idPrestito,
+                idLibro = req.IdLibro,
+                utente = req.Utente
+            }, JsonOptions);
+        }
+        catch
+        {
+            tx.Rollback();
+            throw;
+        }
+    }
+
+    private static string StatoUtente(string? utente)
+    {
+        if (string.IsNullOrWhiteSpace(utente))
+            return RispostaErrata("Utente obbligatorio per consultare lo stato");
+
+        using var conn = new SqliteConnection(ConnectionString);
+        conn.Open();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+SELECT Id, IdLibro, Utente, DataRichiesta, Stato
+FROM Prestiti
+WHERE Utente = @utente
+ORDER BY DataRichiesta DESC";
+        cmd.Parameters.AddWithValue("@utente", utente);
+
+        var prestiti = new List<object>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            prestiti.Add(new
+            {
+                id = reader.GetInt64(0),
+                idLibro = reader.GetInt32(1),
+                utentePrestito = reader.GetString(2),
+                dataRichiesta = reader.GetString(3),
+                stato = reader.GetString(4)
+            });
+        }
+
+        return JsonSerializer.Serialize(new { ok = true, operazione = "stato", utente, prestiti }, JsonOptions);
+    }
+
+    private static string RispostaErrata(string messaggio)
+    {
+        return JsonSerializer.Serialize(new { ok = false, errore = messaggio });
     }
 
     private static void InizializzaDatabase()
