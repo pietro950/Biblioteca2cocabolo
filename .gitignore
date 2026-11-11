@@ -13,6 +13,7 @@ obj/
 *.cache
 *.db-shm
 *.db-wal
+*.db
 *.vsidx
 
 # risultati test
